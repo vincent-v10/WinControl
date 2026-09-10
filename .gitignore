@@ -1,0 +1,22 @@
+node_modules/
+dist/
+.DS_Store
+*.swp
+
+# Working notes for Claude Code — local only, not published.
+CLAUDE.md
+.claude/
+
+# Compiled on first use by main.js, and by `npm run helpers` before a build.
+helper/balance
+helper/eqtap
+
+# Personal, per-machine. All three are optional at runtime:
+# no skins -> Webamp's base skin, no feeds.json -> Hacker News,
+# no settings.json -> defaults. Drop your own .wsz in renderer/skins/.
+# Winamp5_Classified_v5.5 is the exception: it ships, it's FALLBACK_SKIN.
+renderer/skins/*
+!renderer/skins/Winamp5_Classified_v5.5.wsz
+feeds.json
+settings.json
+CLAUDE-ARCHIVE.md

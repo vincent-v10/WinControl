@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>WinControl</title>
+  <style>
+    html, body {
+      margin: 0;
+      height: 100%;
+      background: transparent;
+      overflow: hidden;
+      user-select: none;
+    }
+    /* Webamp renders into #webamp appended to body */
+
+    /* A page that is always bigger than any window stack.
+       Webamp dispatches ensureWindowsAreOnScreen on every browser resize, and
+       measures "the browser window" as the max of body/documentElement's
+       scroll/offset/client size. The OS window is sized *to* the stack
+       (fitWindow in app.js), which is an async round trip through main, so
+       during a playlist resize drag the window is always a frame or two behind
+       the DOM -- and when the stack doesn't fit, that action does not shift, it
+       gives up: resetWindowSizes() + stackWindows() + centerWindowsInView().
+       Measured at real mouse speed: ~10 steps into a drag the playlist snaps
+       back to 4 rows and the whole stack jumps to the middle of the window.
+       An always-oversized page makes the check a no-op. Safe because nothing
+       else reads that size here: its only other consumer is the snap-to-edge in
+       Webamp's own window dragging, which the app-region drag below disables.
+       Invisible (no background, and html/body clip it) and unclickable -- a
+       pseudo-element takes no hit test of its own. */
+    body::after {
+      content: "";
+      display: block;
+      width: 10000px;
+      height: 10000px;
+    }
+
+    /* Drag the OS window by the skin title bars. app-region swallows the
+       mousedown, so Webamp's own in-page window drag never fires (that was
+       the glitch: the skin moved inside the window instead of the window).
+       Main window's bar is id="title-bar"; the EQ's is class="title-bar" --
+       matching only the class left the main bar on Webamp's JS drag, which
+       slides the skin inside the window and stops at its edge, so it could
+       never reach a second display. Do not use Webamp's own .draggable class
+       here: it is also on a full-bleed background div and would swallow every
+       button click. */
+    #webamp #title-bar,
+    #webamp .title-bar,
+    #webamp .playlist-top {
+      -webkit-app-region: drag;
+    }
+    /* Buttons/sliders inside the bars must stay clickable. */
+    #webamp #option-context, #webamp #minimize, #webamp #shade, #webamp #close,
+    #webamp #equalizer-shade, #webamp #equalizer-close,
+    #webamp #equalizer-volume, #webamp #equalizer-balance,
+    #webamp #playlist-shade-button, #webamp #playlist-close-button,
+    #webamp .title-bar input {
+      -webkit-app-region: no-drag;
+    }
+
+    /* Keep the pixel-art skin crisp when zoomed. */
+    #webamp, #webamp * { image-rendering: pixelated; }
+
+    /* The feed-URL field (see askFeedUrl in app.js). Deliberately outside
+       #webamp, so the `image-rendering: pixelated` rule above doesn't blur
+       real text, and so Webamp's own layout never sees it. Colours are the
+       classic Winamp window: raised grey bevel, sunken black field, green
+       text. */
+    #feed-prompt {
+      position: fixed;
+      left: 6px;
+      right: 6px;
+      /* Bottom-anchored, not centred: centred, it straddled the seam between
+         two skin windows and read as an accident. Down here it sits just above
+         the playlist button row -- next to the "+" that opens it -- and it
+         never covers the marquee or the clock. 38px is that row's height in
+         the sprite; with the playlist closed the window is shorter than the
+         offset and the panel simply sits at the top of it. */
+      bottom: 44px;
+      z-index: 10;
+      padding: 6px 7px 5px;
+      background: #202020;
+      border: 1px solid #000;
+      /* The inset ring is the raised edge: a border-colour bevel is invisible
+         against a panel this dark. */
+      box-shadow: inset 0 0 0 1px #4a4a4a, 0 3px 8px rgba(0, 0, 0, 0.7);
+      font: 11px Tahoma, Geneva, Verdana, sans-serif;
+      color: #00ff00;
+      /* It can sit over a title bar, which is a drag region and swallows
+         children unless they opt out. */
+      -webkit-app-region: no-drag;
+    }
+    #feed-prompt label {
+      display: block;
+      margin-bottom: 4px;
+      letter-spacing: 0.08em;
+    }
+    #feed-url {
+      box-sizing: border-box;
+      width: 100%;
+      padding: 3px 4px;
+      background: #000;
+      border: 1px solid;
+      /* Sunken: the panel's bevel inverted. */
+      border-color: #000 #7f7f7f #7f7f7f #000;
+      color: #00ff00;
+      font: inherit;
+      outline: none;
+      /* body sets user-select: none, which kills selection inside a field. */
+      user-select: text;
+    }
+    #feed-url::placeholder { color: #007700; }
+    #feed-prompt .hint {
+      margin-top: 4px;
+      font-size: 10px;
+      color: #909090;
+    }
+    #feed-prompt .hint.error { color: #ff5555; }
+
+    /* A selected or hovered headline wider than the playlist window scrolls
+       from its front to its end, waits there, then starts over -- no reversal.
+       It moves the instant you touch the row; the 2s wait at the front only
+       applies to the repeats (see the negative delay below).
+       Winamp just ellipsizes it.
+       The two widths this needs are already in the DOM: Webamp renders the row
+       as a block div (width = the column) whose title is its own <span> (width
+       = the text). `container-type` on the row makes `100cqw` the row's width;
+       `100%` inside translateX is the span's own, so `100cqw - 100%` is the
+       offset that puts the end of the title at the right edge. The ellipsis is
+       the row's, not the span's, so it has to be cleared or it draws over the
+       moving text. The `min()` is only insurance: the gate below means the
+       animation doesn't exist for a title that fits, but a DOM node Webamp has
+       just recycled can carry the previous row's duration for the one frame
+       before the sweep in app.js clears it, and the clamp keeps that frame
+       still.
+       `--bb-time` and `--bb-ease` are measured in app.js (syncBillboard) -- CSS
+       has no length-to-time conversion, and a fixed duration would make a long
+       headline scroll faster than a short one. The waits at each end are in the
+       easing rather than in keyframe stops, for the same reason: a stop is a
+       share of the duration, so it would make a long headline wait longer.
+       `--bb-delay` is -2s, which skips the front wait on the first pass only --
+       a negative delay shifts the timeline, so every repeat plays whole.
+       `--bb-time` doubles as the overflow gate: unset, the shorthand below is
+       invalid at computed-value time, so animation-name falls back to `none`
+       and a title that fits never moves. */
+    #webamp .playlist-track-titles .track-cell:is(.selected, :hover) {
+      container-type: inline-size;
+      text-overflow: clip;
+    }
+    #webamp .playlist-track-titles .track-cell:is(.selected, :hover) > span {
+      display: inline-block;
+      animation: billboard var(--bb-time) var(--bb-ease) var(--bb-delay) infinite;
+    }
+    @keyframes billboard {
+      from { transform: translateX(0); }
+      to   { transform: translateX(min(0px, calc(100cqw - 100%))); }
+    }
+
+    /* Winamp blinks the digits while paused (`animation: blink 2s step-start`
+       on `.pause .webamp-status #time`, opacity 1 -> 0 -> 1). On a remote
+       that's just a readout flickering off every other second, so hold it.
+       !important because Webamp injects its own stylesheet at runtime, i.e.
+       after this one, and the selector is identical -- order would win. */
+    #webamp .pause .webamp-status #time {
+      animation: none !important;
+      -webkit-animation: none !important;
+    }
+  </style>
+</head>
+<body>
+  <div id="app"></div>
+  <div id="feed-prompt" hidden>
+    <label for="feed-url">ADD FEED</label>
+    <input id="feed-url" type="text" spellcheck="false" autocomplete="off"
+           placeholder="https://example.com/rss" />
+    <div class="hint"></div>
+  </div>
+  <script src="../node_modules/webamp/built/webamp.bundle.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

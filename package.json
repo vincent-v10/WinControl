@@ -1,0 +1,39 @@
+{
+  "name": "wincontrol",
+  "version": "0.1.0",
+  "description": "A Winamp-skinned controller for whatever is playing on your Mac (Spotify app, Bandcamp tabs, anything in Now Playing). Plays nothing itself - pure remote control.",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "helpers": "clang -fobjc-arc -O2 -o helper/balance helper/balance.c -framework CoreFoundation -framework CoreAudio && clang -fobjc-arc -O2 -o helper/eqtap helper/eqtap.m -framework Foundation -framework CoreAudio",
+    "dist": "npm run helpers && electron-builder"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^44.1.0",
+    "electron-builder": "^26.15.3"
+  },
+  "dependencies": {
+    "webamp": "^2.1.2"
+  },
+  "build": {
+    "appId": "be.flux.wincontrol",
+    "productName": "WinControl",
+    "asar": false,
+    "files": [
+      "!**/*.md",
+      "!build/**",
+      "!feeds.json",
+      "!settings.json",
+      "!renderer/skins/!(Winamp5_Classified_v5.5).wsz"
+    ],
+    "mac": {
+      "target": "dmg",
+      "category": "public.app-category.music",
+      "hardenedRuntime": false,
+      "extendInfo": {
+        "NSAudioCaptureUsageDescription": "WinControl taps system audio output to apply the equalizer."
+      }
+    }
+  }
+}
