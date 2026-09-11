@@ -1,6 +1,6 @@
 {
   "name": "wincontrol",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A Winamp-skinned controller for whatever is playing on your Mac (Spotify app, Bandcamp tabs, anything in Now Playing). Plays nothing itself - pure remote control.",
   "main": "main.js",
   "scripts": {
