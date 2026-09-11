@@ -16,6 +16,15 @@ const path = require("path");
 // Before ready, or the app menu keeps saying "Electron".
 app.setName("WinControl");
 
+// package.json, not app.getVersion(): that reads the *Electron* version
+// whenever the app path is not the project root, which is how every harness in
+// scratchpad/ is launched. Shipped in the bundle too (asar: false), so the
+// packaged app reads its own.
+const PKG = require("./package.json");
+const VERSION = PKG.version;
+const APP_ID = PKG.build?.appId;
+const APP_BUNDLE = `${PKG.build?.productName ?? PKG.name}.app`;
+
 // Homebrew paths aren't in Electron's PATH when launched from Finder, so probe directly.
 const MEDIA_CONTROL_CANDIDATES = [
   "/opt/homebrew/bin/media-control", // Apple Silicon
@@ -489,10 +498,7 @@ function showAbout(win) {
     type: "none",
     icon: aboutIcon(),
     title: `About ${app.name}`,
-    // package.json, not app.getVersion(): that reads the *Electron* version
-    // whenever the app path isn't the project root, which is how every harness
-    // in scratchpad/ is launched.
-    message: `${app.name} ${require("./package.json").version}`,
+    message: `${app.name} ${VERSION}`,
     detail: "A Winamp-skinned remote control for whatever macOS is playing.\nPlays no audio itself.",
     buttons: ["OK"],
   });
@@ -599,6 +605,307 @@ async function pickSkin(win) {
   sendSkin(win.webContents, pathToFileURL(filePaths[0]).href);
 }
 
+// ------------------------------------------------------------------- updates
+// Not electron-updater: its macOS half is Squirrel.Mac, which validates the
+// replacement bundle's code signature against the running one and refuses the
+// swap when it can't -- and this app is deliberately unsigned (see
+// hardenedRuntime: false). Delta downloads and a background ShipIt are what
+// that would buy, at the price of a Developer ID this project has decided not
+// to want. So the whole mechanism is: ask the GitHub API for the latest tag,
+// download that release's dmg, and run `npm run release`'s hdiutil dance
+// backwards. Nothing here touches playback, and nothing runs unasked except
+// the packaged app's one silent check at launch.
+const UPDATE_REPO = "vincent-v10/WinControl";
+
+// browser_download_url arrives over TLS from api.github.com, so it is already
+// as trustworthy as the API answer itself -- but this is the one URL in the app
+// that gets downloaded and then *executed*, so it is held to a host allowlist
+// rather than to httpUrl's is-it-http(s) check, which is all a link needs.
+const UPDATE_HOSTS = new Set([
+  "github.com",
+  "objects.githubusercontent.com",
+  "release-assets.githubusercontent.com",
+]);
+
+// Third key in settings.json, and the only one with a meaningful default: an
+// app that can update itself should say so out loud once in a while.
+const autoUpdate = () => settings.autoUpdate !== false;
+
+// One run at a time, and which half it is in: the menu item is the only
+// progress there is until the dock bar starts moving, so it says so.
+let updateBusy = null;   // null | "checking" | "installing"
+
+const parseVer = (v) => {
+  const m = /^v?(\d+)\.(\d+)\.(\d+)(?:-(.+?))?(?:\+.+)?$/.exec(String(v).trim());
+  return m ? { nums: [+m[1], +m[2], +m[3]], pre: m[4] || null } : null;
+};
+
+// Enough semver for the tags `npm version` produces, which is all this ever
+// compares. Unparseable means "don't offer it" -- a repo with a `nightly` tag
+// should not be able to talk this into a downgrade.
+function isNewer(candidate, current) {
+  const a = parseVer(candidate), b = parseVer(current);
+  if (!a || !b) return false;
+  for (let i = 0; i < 3; i++) if (a.nums[i] !== b.nums[i]) return a.nums[i] > b.nums[i];
+  if (a.pre && !b.pre) return false;   // 0.2.0-rc.1 loses to 0.2.0
+  if (!a.pre && b.pre) return true;
+  return a.pre > b.pre;                // semver's own rule for two alphanumerics
+}
+
+async function latestRelease() {
+  const res = await fetch(`https://api.github.com/repos/${UPDATE_REPO}/releases/latest`, {
+    headers: { Accept: "application/vnd.github+json", "User-Agent": `WinControl/${VERSION}` },
+    signal: AbortSignal.timeout(15000),
+  });
+  if (res.status === 404) throw new Error(`${UPDATE_REPO} has no published releases yet.`);
+  if (!res.ok) throw new Error(`HTTP ${res.status} from the GitHub API.`);
+  const rel = await res.json();
+  // `npm run release` builds host arch only, so a repo can easily hold just the
+  // other one. Match process.arch rather than grab whatever dmg is present: an
+  // x64 build installs fine on Apple Silicon and then runs under Rosetta,
+  // silently, forever. A dmg with no arch suffix at all is a universal build.
+  const dmgs = (Array.isArray(rel.assets) ? rel.assets : []).filter((a) => /\.dmg$/i.test(a?.name ?? ""));
+  const asset = dmgs.find((a) => a.name.includes(`-${process.arch}.`))
+    ?? dmgs.find((a) => !/-(arm64|x64)\./.test(a.name));
+  return { version: String(rel.tag_name ?? "").replace(/^v/, ""), notes: String(rel.body ?? ""),
+           page: String(rel.html_url ?? ""), asset };
+}
+
+function assetUrl(asset) {
+  const u = new URL(httpUrl(asset.browser_download_url));   // scheme check first
+  if (!UPDATE_HOSTS.has(u.host)) throw new Error(`refusing a disk image served from ${u.host}.`);
+  return u.href;
+}
+
+// execFile as a promise, for the four command-line tools the install shells out
+// to. Separate from runMediaControl/runOsascript because those carry a 5s
+// timeout -- ditto on a 320 MB bundle does not fit in one -- and because a
+// failure here has to reach a dialog, so stderr goes into the message.
+function runTool(cmd, args) {
+  return new Promise((resolve, reject) => {
+    execFile(cmd, args, { maxBuffer: 8 << 20 }, (err, stdout, stderr) =>
+      err ? reject(new Error(`${cmd}: ${String(stderr || err.message).trim()}`)) : resolve(stdout));
+  });
+}
+
+// Streamed to disk, with the dock's progress bar as the entire UI: 130 MB over
+// a slow line is a long silence otherwise, and a progress window would be the
+// only piece of chrome this app owns.
+async function downloadDmg(url, dest, win) {
+  const res = await fetch(url, { headers: { "User-Agent": `WinControl/${VERSION}` } });
+  if (!res.ok) throw new Error(`HTTP ${res.status} fetching the disk image.`);
+  const total = Number(res.headers.get("content-length")) || 0;
+  const out = fs.createWriteStream(dest);
+  let got = 0, shown = -1;
+  try {
+    for await (const chunk of res.body) {
+      got += chunk.length;
+      if (!out.write(chunk)) await new Promise((r) => out.once("drain", r));
+      // setProgressBar repaints the dock; once per percent, not once per chunk.
+      const pct = total ? Math.floor((got / total) * 100) : -1;
+      if (pct !== shown) { shown = pct; win?.setProgressBar(got / total); }
+    }
+    await new Promise((ok, no) => out.end((e) => (e ? no(e) : ok())));
+  } finally {
+    out.destroy();
+    win?.setProgressBar(-1);
+  }
+  if (total && got !== total) throw new Error(`the download stopped at ${got} of ${total} bytes.`);
+}
+
+// hdiutil's -plist output, read with a regex rather than a plist dependency:
+// the alternative is scraping its plain-text table, and that is the fragile one
+// -- the columns are whitespace-separated and a mount point may contain spaces.
+async function mountDmg(dmg) {
+  const plist = await runTool("hdiutil",
+    ["attach", dmg, "-plist", "-nobrowse", "-readonly", "-mountrandom", app.getPath("temp")]);
+  const m = /<key>mount-point<\/key>\s*<string>([^<]+)<\/string>/.exec(plist);
+  if (!m) throw new Error("hdiutil attached the disk image but reported no mount point.");
+  return m[1];
+}
+
+const detachDmg = (mount) =>
+  runTool("hdiutil", ["detach", mount, "-quiet"])
+    .catch(() => runTool("hdiutil", ["detach", mount, "-force", "-quiet"]))
+    .catch((e) => console.warn("update:", String(e)));
+
+const plistString = (plist, key) =>
+  new RegExp(`<key>${key}</key>\\s*<string>([^<]*)</string>`).exec(plist)?.[1] ?? null;
+
+// The dmg came off the network, so what it contains is checked before it is
+// allowed to replace the running app: right bundle id, right version.
+function verifyBundle(dir, version) {
+  let plist;
+  try {
+    plist = fs.readFileSync(path.join(dir, "Contents", "Info.plist"), "utf8");
+  } catch {
+    throw new Error("that release's disk image has no WinControl.app inside it.");
+  }
+  const id = plistString(plist, "CFBundleIdentifier");
+  if (id !== APP_ID) throw new Error(`the disk image holds ${id ?? "an unidentified app"}, not ${APP_ID}.`);
+  const got = plistString(plist, "CFBundleShortVersionString");
+  if (got !== version) throw new Error(`the disk image holds version ${got ?? "?"}, not ${version}.`);
+}
+
+// /Applications/WinControl.app/Contents/MacOS/WinControl -> /Applications/WinControl.app
+function bundlePath() {
+  const exe = app.getPath("exe");
+  const i = exe.indexOf(`.app${path.sep}`);
+  return i === -1 ? null : exe.slice(0, i + 4);
+}
+
+// Why this copy can't install an update, or null if it can. None of these are
+// worth working around: a translocated bundle lives on a read-only image that
+// AppKit discards at quit, and a bundle in a directory this user can't write is
+// one failed `mv` away from no app at all.
+function installBlocked() {
+  if (!app.isPackaged) return "This is WinControl running from source — use git pull, not the installer.";
+  const target = bundlePath();
+  if (!target) return "WinControl isn't running from an .app bundle.";
+  if (target.includes("/AppTranslocation/")) {
+    return "macOS is running WinControl from a read-only quarantine copy, which can't be updated in place. "
+      + "Move WinControl.app to /Applications in Finder, reopen it, and check again.";
+  }
+  try {
+    fs.accessSync(target, fs.constants.W_OK);
+    fs.accessSync(path.dirname(target), fs.constants.W_OK);
+  } catch {
+    return `${target} isn't writable by this user.`;
+  }
+  return null;
+}
+
+// The last moment of the install, as a detached shell script, because a bundle
+// cannot replace itself while its own executable is mapped. Move-then-move,
+// never delete-then-move: if the second move fails the old app goes straight
+// back, so the worst case is "the update didn't happen" and never "there is no
+// WinControl any more".
+const SWAP_SCRIPT = `#!/bin/sh
+# Written and spawned by WinControl's updater (installUpdate in main.js).
+target=$1; staged=$2; backup=$3; pid=$4; dmg=$5
+n=0
+while kill -0 "$pid" 2>/dev/null && [ "$n" -lt 300 ]; do sleep 0.2; n=$((n + 1)); done
+rm -rf "$backup"
+mv "$target" "$backup" || exit 1
+if mv "$staged" "$target"; then
+  rm -rf "$backup"
+else
+  mv "$backup" "$target"
+  exit 1
+fi
+rmdir "$(dirname "$staged")" 2>/dev/null
+xattr -dr com.apple.quarantine "$target" 2>/dev/null
+rm -f "$dmg"
+open "$target"
+`;
+
+// Download, mount, verify, stage, hand the swap to /bin/sh, quit. Everything
+// slow and everything that can fail happens here, where it can still be
+// reported in a dialog; the script gets only the two renames.
+async function installUpdate(win, rel) {
+  const url = assetUrl(rel.asset);
+  const target = bundlePath();
+  const dmg = path.join(app.getPath("temp"), `WinControl-${rel.version}.dmg`);
+  // Staged beside the target so the swap is a rename on one volume, not a
+  // second 320 MB copy -- and hidden, so a half-finished update never shows up
+  // in /Applications as something to click.
+  const stage = path.join(path.dirname(target), `.WinControl-update-${process.pid}`);
+  const staged = path.join(stage, APP_BUNDLE);
+  let mount = null;
+  try {
+    try {
+      await downloadDmg(url, dmg, win);
+      mount = await mountDmg(dmg);
+      const src = path.join(mount, APP_BUNDLE);
+      verifyBundle(src, rel.version);
+      fs.rmSync(stage, { recursive: true, force: true });
+      fs.mkdirSync(stage, { recursive: true });
+      // ditto, not cp -R: it is the copy that keeps symlinks, the Frameworks
+      // tree's layout and every mode bit intact, and it is what the rest of
+      // macOS installs bundles with.
+      await runTool("ditto", [src, staged]);
+      await runTool("xattr", ["-dr", "com.apple.quarantine", staged]).catch(() => {});
+    } finally {
+      if (mount) await detachDmg(mount);   // always, and before any cleanup below
+    }
+  } catch (e) {
+    fs.rmSync(stage, { recursive: true, force: true });
+    fs.rmSync(dmg, { force: true });
+    throw e;
+  }
+
+  const script = path.join(app.getPath("temp"), "wincontrol-swap.sh");
+  fs.writeFileSync(script, SWAP_SCRIPT, { mode: 0o755 });
+  const backup = path.join(path.dirname(target), `.WinControl-old-${process.pid}.app`);
+  spawn("/bin/sh", [script, target, staged, backup, String(process.pid), dmg],
+        { detached: true, stdio: "ignore" }).unref();
+  stopEq();   // drop the tap while its owner can still do it cleanly
+  app.quit();
+}
+
+const updateBox = (opts) => {
+  const o = { type: "none", icon: aboutIcon(), title: "Software Update", ...opts };
+  return mainWin ? dialog.showMessageBox(mainWin, o) : dialog.showMessageBox(o);
+};
+
+// silent: launch-time check. It speaks only when there is something to install
+// -- no "you're up to date" on every cold start, and no dialog for a laptop
+// that opened the app on a train with no signal.
+async function checkForUpdates({ silent } = {}) {
+  if (updateBusy) return;
+  updateBusy = "checking";
+  rebuildMenu();
+  // Which half of the run failed. The check may be silent, but an install the
+  // user asked for never is -- it ends with the app either relaunched or still
+  // here, and "still here" needs a reason.
+  let installing = false;
+  try {
+    const rel = await latestRelease();
+    if (!isNewer(rel.version, VERSION)) {
+      if (!silent) await updateBox({ message: `${app.name} ${VERSION} is the latest version.`, buttons: ["OK"] });
+      return;
+    }
+    // Two reasons the app can only point at the release page rather than
+    // install it: this copy can't be written, or that release has no dmg for
+    // this architecture. Both are worth saying plainly.
+    const why = installBlocked()
+      ?? (rel.asset ? null : `That release has no ${process.arch} disk image.`);
+    const notes = rel.notes.replace(/\r/g, "").trim();
+    const excerpt = notes.length > 700 ? notes.slice(0, 700).replace(/\s+\S*$/, "") + "…" : notes;
+    const buttons = why ? ["Open Release Page", "Later"]
+                        : ["Download and Install", "Release Notes", "Later"];
+    const { response } = await updateBox({
+      message: `${app.name} ${rel.version} is available.`,
+      detail: [why ?? `You have ${VERSION}. WinControl will download it, install it, and relaunch.`,
+               excerpt].filter(Boolean).join("\n\n"),
+      buttons, defaultId: 0, cancelId: buttons.length - 1,
+    });
+    if (why) {
+      if (response === 0) openLink(rel.page);
+      return;
+    }
+    if (response === 1) return void openLink(rel.page);
+    if (response !== 0) return;
+    installing = true;
+    updateBusy = "installing";
+    rebuildMenu();
+    await installUpdate(mainWin, rel);
+  } catch (e) {
+    const msg = String(e?.message ?? e);
+    console.warn("update:", msg);
+    if (!silent || installing) {
+      await updateBox({
+        type: "warning", icon: undefined,
+        message: installing ? "Couldn't install the update." : "Couldn't check for updates.",
+        detail: msg, buttons: ["OK"],
+      });
+    }
+  } finally {
+    updateBusy = null;
+    rebuildMenu();
+  }
+}
+
 // Webamp's own right-click menu is a DOM node inside a small frameless window
 // with overflow:hidden, so it gets clipped (73px off the right edge near the
 // window border) with no way to scroll to the hidden items. Same options, as a
@@ -658,6 +965,19 @@ function buildMenu(win) {
       label: app.name,
       submenu: [
         { label: `About ${app.name}`, click: () => showAbout(win) },
+        { type: "separator" },
+        {
+          label: updateBusy === "installing" ? "Installing Update…"
+               : updateBusy ? "Checking for Updates…" : "Check for Updates…",
+          enabled: !updateBusy,
+          click: () => checkForUpdates(),
+        },
+        {
+          label: "Check Automatically",
+          type: "checkbox",
+          checked: autoUpdate(),
+          click: () => saveSettings({ autoUpdate: !autoUpdate() }),
+        },
         { type: "separator" },
         { role: "services" },
         { type: "separator" },
@@ -785,5 +1105,13 @@ function createWindow() {
   rebuildMenu();
 }
 
-app.whenReady().then(createWindow);
+// Packaged only. From source there is nothing installable, and the harnesses
+// in scratchpad/ require() this file -- an unstubbed network call on every test
+// run is exactly the sort of thing that makes a suite flaky. The delay keeps it
+// clear of the first paint and the first now-playing poll; the check itself is
+// silent unless it finds something.
+app.whenReady().then(() => {
+  createWindow();
+  if (app.isPackaged && autoUpdate()) setTimeout(() => checkForUpdates({ silent: true }), 8000);
+});
 app.on("window-all-closed", () => app.quit());
