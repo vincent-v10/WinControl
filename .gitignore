@@ -20,3 +20,7 @@ renderer/skins/*
 feeds.json
 settings.json
 CLAUDE-ARCHIVE.md
+
+# Built DMGs, archived per version by `npm run release`. Too big for git
+# (a 100+ MB DMG exceeds GitHub's file limit); they live on GitHub Releases.
+releases/
