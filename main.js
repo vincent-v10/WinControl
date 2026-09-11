@@ -22,8 +22,12 @@ app.setName("WinControl");
 // packaged app reads its own.
 const PKG = require("./package.json");
 const VERSION = PKG.version;
-const APP_ID = PKG.build?.appId;
-const APP_BUNDLE = `${PKG.build?.productName ?? PKG.name}.app`;
+// app.setName ran above, so this is right in dev and packaged alike. NOT
+// PKG.build.productName: electron-builder strips the whole `build` key out of
+// the package.json it ships (see ownAppId), and the fallback PKG.name is
+// "wincontrol" lowercase -- which only looked like it worked because APFS is
+// case-insensitive.
+const APP_BUNDLE = `${app.name}.app`;
 
 // Homebrew paths aren't in Electron's PATH when launched from Finder, so probe directly.
 const MEDIA_CONTROL_CANDIDATES = [
@@ -657,7 +661,14 @@ async function latestRelease() {
     headers: { Accept: "application/vnd.github+json", "User-Agent": `WinControl/${VERSION}` },
     signal: AbortSignal.timeout(15000),
   });
-  if (res.status === 404) throw new Error(`${UPDATE_REPO} has no published releases yet.`);
+  // GitHub answers 404 to an unauthenticated caller for BOTH "no releases yet"
+  // and "no access", so a private repo is indistinguishable from an empty one
+  // from out here -- and once a release exists, private is the likelier of the
+  // two. Name both, or this reads as a publishing failure that never happened.
+  if (res.status === 404) {
+    throw new Error(`${UPDATE_REPO} has no published releases, or is not public.`
+      + " GitHub answers 404 to both.");
+  }
   if (!res.ok) throw new Error(`HTTP ${res.status} from the GitHub API.`);
   const rel = await res.json();
   // `npm run release` builds host arch only, so a repo can easily hold just the
@@ -734,6 +745,25 @@ const plistString = (plist, key) =>
 
 // The dmg came off the network, so what it contains is checked before it is
 // allowed to replace the running app: right bundle id, right version.
+// electron-builder strips `build` out of the package.json it ships, so
+// PKG.build is undefined at runtime in a packaged app. Measured the hard way:
+// it made verifyBundle compare every disk image against `undefined` and refuse
+// every update. A packaged app's own Info.plist is the better source anyway --
+// the question is "is this dmg the same app as me", not "does it match a config
+// file that isn't even there". package.json is the dev fallback, where there is
+// no bundle to read.
+function ownAppId() {
+  if (!app.isPackaged) return PKG.build?.appId ?? null;
+  try {
+    const target = bundlePath();
+    if (!target) return null;
+    return plistString(fs.readFileSync(path.join(target, "Contents", "Info.plist"), "utf8"),
+                       "CFBundleIdentifier");
+  } catch {
+    return null;
+  }
+}
+
 function verifyBundle(dir, version) {
   let plist;
   try {
@@ -741,8 +771,12 @@ function verifyBundle(dir, version) {
   } catch {
     throw new Error("that release's disk image has no WinControl.app inside it.");
   }
+  // Refuse rather than skip when our own identity is unreadable: a check that
+  // waves things through on failure is not a check.
+  const want = ownAppId();
+  if (!want) throw new Error("can't read this app's own bundle identifier to compare against.");
   const id = plistString(plist, "CFBundleIdentifier");
-  if (id !== APP_ID) throw new Error(`the disk image holds ${id ?? "an unidentified app"}, not ${APP_ID}.`);
+  if (id !== want) throw new Error(`the disk image holds ${id ?? "an unidentified app"}, not ${want}.`);
   const got = plistString(plist, "CFBundleShortVersionString");
   if (got !== version) throw new Error(`the disk image holds version ${got ?? "?"}, not ${version}.`);
 }
